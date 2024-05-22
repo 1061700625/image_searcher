@@ -85,7 +85,7 @@ class ImageRetrievalApp:
         # 初始化变量
         self.target_img_path = StringVar()
         self.folder_path = StringVar()
-        self.threshold = DoubleVar(value=0.8)
+        self.threshold = DoubleVar(value=0.9)
         self.top_n = IntVar(value=10)
         self.max_keypoints = IntVar(value=5000)
         self.search_type = StringVar(value="相似度阈值")
@@ -257,7 +257,7 @@ class ImageRetrievalApp:
         else:
             self.max_keypoints_entry.grid_forget()
         
-        threading.Thread(target=load_model, args=(self.model_name.get(), self.max_keypoints.get(), self.model_loaded)).start()
+        threading.Thread(target=load_model, args=(self.model_name.get(), self.max_keypoints.get(), self.model_loaded), daemon=True).start()
     
     def model_loaded(self):
         self.model_option.config(state="readonly")
@@ -282,10 +282,10 @@ class ImageRetrievalApp:
         
         if self.search_type.get() == "相似度阈值":
             threshold = self.threshold.get()
-            threading.Thread(target=self.search_by_threshold, args=(threshold,)).start()
+            threading.Thread(target=self.search_by_threshold, args=(threshold,), daemon=True).start()
         else:
             top_n = self.top_n.get()
-            threading.Thread(target=self.search_top_n, args=(top_n,)).start()
+            threading.Thread(target=self.search_top_n, args=(top_n,), daemon=True).start()
     
     def stop_search_func(self):
         self.stop_search = True
