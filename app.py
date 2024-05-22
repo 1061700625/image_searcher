@@ -2,6 +2,8 @@ import os
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
+import cv2
+import numpy as np
 import PIL
 from PIL import Image
 from sklearn.metrics.pairwise import cosine_similarity
@@ -16,13 +18,14 @@ import base64
 # 模型字典
 model_dict = {
     "ResNet50": models.resnet50,
-    "VGG16": models.vgg16
+    "VGG16": models.vgg16,
+    "SIFT": "SIFT"
 }
 
 # 全局模型变量
 model = None
 
-def load_model(model_name, callback):
+def load_model(model_name, max_keypoints, callback):
     global model
     if model_name == "ResNet50":
         weights = models.ResNet50_Weights.IMAGENET1K_V1
@@ -32,7 +35,10 @@ def load_model(model_name, callback):
         weights = models.VGG16_Weights.IMAGENET1K_V1
         model = model_dict[model_name](weights=weights)
         model.classifier = nn.Sequential(*list(model.classifier.children())[:-1])  # 去掉最后一层分类层
-    model.eval()
+    elif model_name == "SIFT":
+        model = cv2.SIFT_create(nfeatures=max_keypoints)
+    if model_name != "SIFT":
+        model.eval()
     callback()
 
 # 图像预处理
@@ -43,12 +49,20 @@ preprocess = transforms.Compose([
 ])
 
 # 提取图像特征的函数
-def extract_features(img_path, model):
-    img = PIL.Image.open(img_path).convert('RGB')
-    img = preprocess(img).unsqueeze(0)  # 添加批次维度
-    with torch.no_grad():
-        features = model(img).squeeze().numpy()
-    return features
+def extract_features(img_path, model, max_keypoints):
+    if isinstance(model, cv2.SIFT):
+        img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)  # 解决中文路径问题
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        keypoints, descriptors = model.detectAndCompute(gray, None)
+        if descriptors is not None and len(descriptors) > max_keypoints:
+            descriptors = descriptors[:max_keypoints]  # 只取前max_keypoints个描述子
+        return descriptors
+    else:
+        img = PIL.Image.open(img_path).convert('RGB')
+        img = preprocess(img).unsqueeze(0)  # 添加批次维度
+        with torch.no_grad():
+            features = model(img).squeeze().numpy()
+        return features
 
 # 创建图形用户界面
 class ImageRetrievalApp:
@@ -65,7 +79,7 @@ class ImageRetrievalApp:
         self.root.iconphoto(False, icon_image)
         
         # 固定窗口大小
-        self.root.geometry("530x700")
+        self.root.geometry("500x700")
         self.root.resizable(False, False)
         
         # 初始化变量
@@ -73,6 +87,7 @@ class ImageRetrievalApp:
         self.folder_path = StringVar()
         self.threshold = DoubleVar(value=0.8)
         self.top_n = IntVar(value=10)
+        self.max_keypoints = IntVar(value=5000)
         self.search_type = StringVar(value="相似度阈值")
         self.model_name = StringVar(value="ResNet50")
         self.stop_search = False
@@ -126,8 +141,12 @@ class ImageRetrievalApp:
         self.option_value = ttk.Entry(input_frame, textvariable=self.threshold, validate='key', validatecommand=vcmd, width=5)
         self.option_value.grid(row=3, column=2, padx=5, pady=5)
         
+        Label(input_frame, text="最大检测点数:").grid(row=4, column=0, padx=5, pady=5, sticky=W)
+        self.max_keypoints_entry = ttk.Entry(input_frame, textvariable=self.max_keypoints, width=10)
+        self.max_keypoints_entry.grid(row=4, column=1, padx=5, pady=5)
+        
         button_frame = Frame(input_frame)
-        button_frame.grid(row=4, column=0, columnspan=3, pady=10)
+        button_frame.grid(row=5, column=0, columnspan=3, pady=10)
 
         self.start_button = ttk.Button(button_frame, text="开始", command=self.start_search)
         self.start_button.pack(side=LEFT, padx=5)
@@ -231,7 +250,14 @@ class ImageRetrievalApp:
         self.start_button.config(state="disabled")
         self.stop_button.config(state="disabled")
         self.download_label.grid(row=5, column=0, columnspan=3, padx=10, pady=10)
-        threading.Thread(target=load_model, args=(self.model_name.get(), self.model_loaded)).start()
+        
+        # 显示或隐藏最大检测点数输入框
+        if self.model_name.get() == "SIFT":
+            self.max_keypoints_entry.grid(row=4, column=1, padx=5, pady=5)
+        else:
+            self.max_keypoints_entry.grid_forget()
+        
+        threading.Thread(target=load_model, args=(self.model_name.get(), self.max_keypoints.get(), self.model_loaded)).start()
     
     def model_loaded(self):
         self.model_option.config(state="readonly")
@@ -250,7 +276,7 @@ class ImageRetrievalApp:
         self.results = []
         self.result_list.delete(0, END)
         self.progress["value"] = 0
-        self.progress["maximum"] = len(os.listdir(self.folder_path.get()))
+        self.progress["maximum"] = len([f for f in os.listdir(self.folder_path.get()) if f.lower().endswith(('png', 'jpg', 'jpeg'))])
         
         self.start_button.config(state="disabled")
         
@@ -275,26 +301,31 @@ class ImageRetrievalApp:
 
     def search_by_threshold(self, threshold):
         try:
-            target_features = extract_features(self.target_img_path.get(), model)
+            target_features = extract_features(self.target_img_path.get(), model, self.max_keypoints.get())
             folder_path = self.folder_path.get()
-            total_files = len(os.listdir(folder_path))
+            image_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('png', 'jpg', 'jpeg'))]
+            total_files = len(image_files)
             
-            for index, img_filename in enumerate(tqdm(os.listdir(folder_path), desc="Processing images")):
+            for index, img_filename in enumerate(tqdm(image_files, desc="Processing images")):
                 if self.stop_search:
                     break
                 img_path = os.path.join(folder_path, img_filename)
-                img_features = extract_features(img_path, model)
-                similarity = cosine_similarity([target_features], [img_features])[0][0]
+                img_features = extract_features(img_path, model, self.max_keypoints.get())
+                if self.model_name.get() == "SIFT":
+                    similarity = self.compute_sift_similarity(target_features, img_features)
+                else:
+                    similarity = self.compute_deep_similarity(target_features, img_features)
                 
                 progress_percent = int((index + 1) / total_files * 100)
                 self.progress_label.config(text=f"{progress_percent}%")
-                self.progress["value"] = progress_percent
+                self.progress["value"] = index + 1
                 self.current_file_label.config(text=f"当前处理文件: {img_filename}, 相似度: {similarity:.4f}")
                 
                 if similarity >= threshold:
                     self.results.append((img_filename, similarity))
                     self.result_list.insert(END, f"图片: {img_filename}, 相似度: {similarity:.4f}")
-                    self.root.update_idletasks()
+                
+                self.root.update_idletasks()
             
             if not self.stop_search:
                 self.update_result_list()
@@ -303,24 +334,28 @@ class ImageRetrievalApp:
             messagebox.showerror("错误", str(e))
         finally:
             self.start_button.config(state="normal")
-    
+
     def search_top_n(self, top_n):
         try:
-            target_features = extract_features(self.target_img_path.get(), model)
+            target_features = extract_features(self.target_img_path.get(), model, self.max_keypoints.get())
             folder_path = self.folder_path.get()
-            total_files = len(os.listdir(folder_path))
+            image_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('png', 'jpg', 'jpeg'))]
+            total_files = len(image_files)
             
             similarities = []
-            for index, img_filename in enumerate(tqdm(os.listdir(folder_path), desc="Processing images")):
+            for index, img_filename in enumerate(tqdm(image_files, desc="Processing images")):
                 if self.stop_search:
                     break
                 img_path = os.path.join(folder_path, img_filename)
-                img_features = extract_features(img_path, model)
-                similarity = cosine_similarity([target_features], [img_features])[0][0]
+                img_features = extract_features(img_path, model, self.max_keypoints.get())
+                if self.model_name.get() == "SIFT":
+                    similarity = self.compute_sift_similarity(target_features, img_features)
+                else:
+                    similarity = self.compute_deep_similarity(target_features, img_features)
                 
                 progress_percent = int((index + 1) / total_files * 100)
                 self.progress_label.config(text=f"{progress_percent}%")
-                self.progress["value"] = progress_percent
+                self.progress["value"] = index + 1
                 self.current_file_label.config(text=f"当前处理文件: {img_filename}, 相似度: {similarity:.4f}")
                 
                 similarities.append((img_filename, similarity))
@@ -335,6 +370,15 @@ class ImageRetrievalApp:
             messagebox.showerror("错误", str(e))
         finally:
             self.start_button.config(state="normal")
+
+    def compute_sift_similarity(self, features1, features2):
+        bf = cv2.BFMatcher()
+        matches = bf.knnMatch(features1.reshape(-1, 128), features2.reshape(-1, 128), k=2)
+        good_matches = [m for m, n in matches if m.distance < (1 - self.threshold.get()) * n.distance]
+        return len(good_matches) / len(matches) if matches else 0
+    
+    def compute_deep_similarity(self, features1, features2):
+        return cosine_similarity([features1], [features2])[0][0]
     
     def open_image(self, event):
         selection = self.result_list.curselection()
